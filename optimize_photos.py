@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-optimize_photos.py — Сжатие и чистка фото для GitHub Pages
+optimize_photos.py v2 — Сжатие и чистка фото для GitHub Pages
 
-1. Находит UUID всех фото, реально используемых в HTML и base64 B данных
-2. Соотносит с файлами на диске (регистронезависимо)
-3. Удаляет неиспользуемые
-4. Сжимает WebP до quality=80, max 2500px через cwebp
+Исправлено: сравнение идёт по UUID без расширения (Path().stem)
+- B данные ссылаются на /photos/Image-xxx.webp
+- На диске файлы Image-xxx.webp
+- Сравниваем stem (Image-xxx) регистронезависимо
 """
 
-import os
 import re
 import json
 import base64
 import subprocess
 from pathlib import Path
-from collections import defaultdict
 
 PHOTOS_DIR = Path('photos')
 HTML_DIR = Path('.')
@@ -23,22 +21,14 @@ MAX_SIZE = 2500
 QUALITY = 80
 
 
-def extract_uuids_from_html():
-    """Extract all photo UUIDs from HTML files (direct /photos/ references)."""
+def get_referenced_uuids():
+    """Get ALL photo UUIDs referenced by any B data or HTML.
+    
+    Нормализует: убирает расширение и trailing dots, lowercase.
+    """
     uuids = set()
-    for hf in sorted(HTML_DIR.glob('*.html')):
-        content = hf.read_text(errors='ignore')
-        # Match /photos/image-<uuid> or /photos/upload-<uuid> (any extension)
-        for m in re.finditer(r'/photos/([\w-]+)', content):
-            filename = m.group(1).lower()
-            # Extract UUID (it's the whole thing for Readymag)
-            uuids.add(filename)
-    return uuids
-
-
-def extract_uuids_from_bdata():
-    """Extract all photo URLs from base64 B data."""
-    uuids = set()
+    
+    # From B data files
     for df in sorted(DATA_DIR.glob('*-data.js')):
         content = df.read_text(errors='ignore')
         m = re.search(r"var B='([^']+)'", content)
@@ -46,11 +36,21 @@ def extract_uuids_from_bdata():
             continue
         try:
             decoded = base64.b64decode(m.group(1))
-            # Find all photo URLs in the JSON structure
             for ref in re.findall(rb'/photos/([\w.-]+)', decoded):
-                uuids.add(ref.decode().lower())
+                ref = ref.decode()
+                uuid = Path(ref).stem  # removes .webp, .jpg, .png
+                uuids.add(uuid.lower())
         except Exception:
             pass
+    
+    # From HTML direct references  
+    for hf in sorted(HTML_DIR.glob('*.html')):
+        content = hf.read_text(errors='ignore')
+        for m in re.finditer(r'/photos/([\w.-]+)', content):
+            ref = m.group(1)
+            uuid = Path(ref).stem  # removes trailing dot or extension
+            uuids.add(uuid.lower())
+    
     return uuids
 
 
@@ -67,7 +67,7 @@ def compress_webp(path, quality=QUALITY, max_size=MAX_SIZE):
         if result.returncode == 0 and temp_path.exists():
             old_size = path.stat().st_size
             new_size = temp_path.stat().st_size
-            if new_size < old_size * 0.95:  # At least 5% savings
+            if new_size < old_size * 0.95:
                 temp_path.replace(path)
                 return old_size - new_size
             temp_path.unlink()
@@ -78,38 +78,33 @@ def compress_webp(path, quality=QUALITY, max_size=MAX_SIZE):
 
 def main():
     print("=" * 60)
-    print("Оптимизация фото для GitHub Pages")
+    print("Оптимизация фото для GitHub Pages (v2)")
     print("=" * 60)
     
     if not PHOTOS_DIR.exists():
         print("✗ photos/ не найдена")
         return
     
-    all_photos = list(PHOTOS_DIR.iterdir())
+    all_photos = sorted(PHOTOS_DIR.iterdir())
     total = len(all_photos)
     total_size = sum(f.stat().st_size for f in all_photos if f.is_file())
     print(f"\nВсего файлов: {total}, размер: {total_size / 1024 / 1024:.0f} MB")
     
-    # Collect all referenced UUIDs
-    html_uuids = extract_uuids_from_html()
-    bdata_uuids = extract_uuids_from_bdata()
-    all_referenced = html_uuids | bdata_uuids
+    # Get referenced UUIDs
+    referenced = get_referenced_uuids()
+    print(f"Уникальных UUID в референсах: {len(referenced)}")
     
-    print(f"Референсы из HTML: {len(html_uuids)}")
-    print(f"Референсы из B данных: {len(bdata_uuids)}")
-    print(f"Уникальных референсов: {len(all_referenced)}")
-    
-    # Map disk files to referenced UUIDs (case-insensitive)
+    # Match disk files to references (by stem, case-insensitive)
     referenced_disk = set()
     for f in all_photos:
         if not f.is_file():
             continue
-        # Normalize: remove extension, lowercase
-        name_noext = f.stem.lower()
-        if name_noext in all_referenced:
+        uuid = f.stem.lower()
+        if uuid in referenced:
             referenced_disk.add(f.name)
     
     print(f"Найдено на диске из референсов: {len(referenced_disk)}")
+    print(f"Неиспользуемых на диске: {total - len(referenced_disk)}")
     
     # Delete unreferenced photos
     deleted = 0
@@ -120,11 +115,12 @@ def main():
             f.unlink()
             deleted += 1
     
-    print(f"Удалено неиспользуемых: {deleted} ({deleted_size / 1024 / 1024:.0f} MB)")
+    print(f"\nУдалено неиспользуемых: {deleted} ({deleted_size / 1024 / 1024:.0f} MB)")
     
-    # Re-compress remaining photos
+    # Re-compress remaining photos with cwebp
     remaining = list(PHOTOS_DIR.iterdir())
-    print(f"\nСжатие {len(remaining)} фото...")
+    if remaining:
+        print(f"\nСжатие {len(remaining)} фото через cwebp (quality={QUALITY}, max={MAX_SIZE}px)...")
     
     total_saved = 0
     compressed = 0
@@ -147,7 +143,7 @@ def main():
     print(f"  Файлов: {final_count}")
     print(f"  Размер: {final_size / 1024 / 1024:.0f} MB")
     print(f"  Сэкономлено: {(deleted_size + total_saved) / 1024 / 1024:.0f} MB")
-    print(f"  Дополнительно сжато: {compressed} файлов, -{total_saved / 1024 / 1024:.1f} MB")
+    print(f"  Доп. сжато: {compressed} файлов, -{total_saved / 1024 / 1024:.1f} MB")
     print(f"{'=' * 60}")
 
 
